@@ -1,0 +1,193 @@
+name: 'Genesis Kit Release'
+description: 'Creates GitHub releases for Genesis kits'
+author: 'Genesis Community'
+
+inputs:
+  kit_name:
+    description: 'Name of the Genesis kit'
+    required: true
+  version:
+    description: 'Version number to release'
+    required: true
+  previous_version:
+    description: 'Previous version number'
+    required: false
+    default: '0.0.0'
+  release_notes_file:
+    description: 'Path to release notes file'
+    required: false
+    default: 'release-notes/release-notes.md'
+  prerelease:
+    description: 'Whether this is a prerelease'
+    required: false
+    default: 'false'
+  has_breaking_changes:
+    description: 'Whether breaking changes were detected'
+    required: false
+    default: 'false'
+  github_token:
+    description: 'GitHub token for operations'
+    required: true
+  spec_diffs_path:
+    description: 'Path to the spec diff files'
+    required: false
+    default: 'spec-check'
+  artifact_path:
+    description: 'Path to the build artifacts'
+    required: false
+    default: 'build'
+  notification_webhook:
+    description: 'Webhook URL for notifications'
+    required: false
+  notification_username:
+    description: 'Username for notification authentication'
+    required: false
+  notification_password:
+    description: 'Password for notification authentication'
+    required: false
+
+runs:
+  using: 'composite'
+  steps:
+    # CREATE RELEASE
+    - name: Prepare Release Assets
+      shell: bash
+      run: |
+        # Ensure paths exist
+        mkdir -p ${{ inputs.artifact_path }}
+        
+        # Check if kit tarball exists
+        if [[ ! -f "${{ inputs.artifact_path }}/${{ inputs.kit_name }}-${{ inputs.version }}.tar.gz" ]]; then
+          echo "Kit tarball not found at expected location. Building kit..."
+          
+          # Install Genesis if needed
+          if ! command -v genesis &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y build-essential unzip jq
+            curl -Lo genesis https://github.com/genesis-community/genesis/releases/latest/download/genesis
+            chmod +x genesis
+            sudo mv genesis /usr/local/bin/
+          fi
+          
+          # Build kit
+          genesis compile-kit --force -v "${{ inputs.version }}" -n "${{ inputs.kit_name }}"
+          cp ./${{ inputs.kit_name }}-${{ inputs.version }}.tar.gz ${{ inputs.artifact_path }}/
+        fi
+        
+        # Prepare spec diffs if they exist
+        if [[ -d "${{ inputs.spec_diffs_path }}" ]]; then
+          if command -v aha &> /dev/null; then
+            echo "Converting spec diffs to HTML..."
+          else
+            sudo apt-get update && sudo apt-get install -y aha
+          fi
+          
+          for diff in ${{ inputs.spec_diffs_path }}/diff-*; do
+            if [ -f "$diff" ]; then
+              cat "$diff" | aha > "${diff}.html"
+            fi
+          done
+        fi
+
+    - name: Create GitHub Release
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+      run: |
+        # Get release notes
+        if [[ -f "${{ inputs.release_notes_file }}" ]]; then
+          release_notes=$(cat "${{ inputs.release_notes_file }}")
+        else
+          release_notes="Release v${{ inputs.version }}"
+        fi
+        
+        # Escape newlines for JSON
+        release_notes_escaped=$(echo "$release_notes" | awk '{printf "%s\\n", $0}')
+        
+        # Add breaking changes warning if needed
+        if [[ "${{ inputs.has_breaking_changes }}" == "true" ]]; then
+          release_notes_escaped="⚠️ BREAKING CHANGES DETECTED ⚠️\\n\\n${release_notes_escaped}"
+        fi
+        
+        # Create JSON payload for release
+        cat > release_payload.json << EOF
+        {
+          "tag_name": "v${{ inputs.version }}",
+          "name": "v${{ inputs.version }}",
+          "body": "${release_notes_escaped}",
+          "draft": false,
+          "prerelease": ${{ inputs.prerelease }},
+          "generate_release_notes": false
+        }
+        EOF
+        
+        # Create the release
+        response=$(curl -s \
+          -X POST \
+          -H "Authorization: token $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/$GITHUB_REPOSITORY/releases" \
+          -d @release_payload.json)
+        
+        # Get release ID
+        release_id=$(echo "$response" | jq -r .id)
+        
+        if [[ "$release_id" == "null" ]]; then
+          echo "Failed to create release. Response: $response"
+          exit 1
+        fi
+        
+        # Upload the kit tarball
+        echo "Uploading kit tarball..."
+        curl \
+          -X POST \
+          -H "Authorization: token $GITHUB_TOKEN" \
+          -H "Content-Type: application/octet-stream" \
+          -H "Accept: application/vnd.github.v3+json" \
+          --data-binary @${{ inputs.artifact_path }}/${{ inputs.kit_name }}-${{ inputs.version }}.tar.gz \
+          "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=${{ inputs.kit_name }}-${{ inputs.version }}.tar.gz"
+        
+        # Upload spec diffs if they exist
+        if [[ -d "${{ inputs.spec_diffs_path }}" ]]; then
+          for diff_html in ${{ inputs.spec_diffs_path }}/*.html; do
+            if [ -f "$diff_html" ]; then
+              asset_name=$(basename "$diff_html")
+              echo "Uploading spec diff: $asset_name"
+              curl \
+                -X POST \
+                -H "Authorization: token $GITHUB_TOKEN" \
+                -H "Content-Type: text/html" \
+                -H "Accept: application/vnd.github.v3+json" \
+                --data-binary @"$diff_html" \
+                "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$asset_name"
+            fi
+          done
+        fi
+        
+        echo "::notice ::Release v${{ inputs.version }} created successfully"
+
+    - name: Send Notification
+      if: inputs.notification_webhook != ''
+      shell: bash
+      env:
+        NOTIFICATION_WEBHOOK: ${{ inputs.notification_webhook }}
+        NOTIFICATION_USERNAME: ${{ inputs.notification_username }}
+        NOTIFICATION_PASSWORD: ${{ inputs.notification_password }}
+      run: |
+        # Prepare notification message
+        status_icon="✅"
+        message="${status_icon} Successfully released ${{ inputs.kit_name }} v${{ inputs.version }}"
+        
+        if [[ "${{ inputs.has_breaking_changes }}" == "true" ]]; then
+          message="${message} ⚠️ Contains breaking changes!"
+        fi
+        
+        # Add release URL
+        release_url="https://github.com/$GITHUB_REPOSITORY/releases/tag/v${{ inputs.version }}"
+        message="${message} ${release_url}"
+        
+        # Send notification
+        curl -X POST "${NOTIFICATION_WEBHOOK}" \
+          -u "${NOTIFICATION_USERNAME}:${NOTIFICATION_PASSWORD}" \
+          -H "Content-Type: application/json" \
+          -d "{\"message\": \"${message}\", \"topic\": \"${{ inputs.kit_name }}-release\"}"
